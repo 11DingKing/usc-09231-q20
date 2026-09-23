@@ -2,7 +2,12 @@ import warnings
 from struct import pack
 from unittest import TestCase, mock
 
+from twisted.internet.error import ConnectionDone
+
 from vncdotool import rfb
+from vncdotool.security import base as security_base
+
+MAX_REASON_LENGTH = security_base.MAX_REASON_LENGTH
 
 
 class TestRFB(TestCase):
@@ -57,6 +62,114 @@ class TestRFB(TestCase):
         self.client.vncProtocolError.assert_called_once()
         self.client.transport.loseConnection.assert_called_once()
         assert self.client._aborted
+
+    def _drive_conn_failed(self, declared: int, payload: bytes):
+        self.client.vncProtocolError = mock.Mock()
+        self.client._handler = self.client._handleExpected
+        self.client._handleConnFailed(pack("!I", declared))
+        self.client._packet += payload
+        self.client._handler()
+        return self.client.vncProtocolError.call_args.args[0]
+
+    def test_conn_failed_short_reason_is_kept_intact(self):
+        reason = b"Too many security failures"
+        message = self._drive_conn_failed(len(reason), reason)
+        assert reason.decode() in message
+        assert "truncated" not in message
+        self.client.transport.loseConnection.assert_called_once()
+
+    def test_conn_failed_empty_reason_is_accepted(self):
+        message = self._drive_conn_failed(0, b"")
+        assert "Connection refused" in message
+        assert "truncated" not in message
+        self.client.transport.loseConnection.assert_called_once()
+
+    def test_conn_failed_reason_at_exactly_the_limit_is_not_truncated(self):
+        reason = b"a" * MAX_REASON_LENGTH
+        message = self._drive_conn_failed(MAX_REASON_LENGTH, reason)
+        assert "truncated" not in message
+
+    def test_conn_failed_overlong_reason_is_bounded_and_truncated(self):
+        declared = 0xFFFFFFFF
+        self.client.vncProtocolError = mock.Mock()
+        self.client._handler = self.client._handleExpected
+        self.client._handleConnFailed(pack("!I", declared))
+        # it must not park on the declared 4 GiB
+        assert self.client._expected_len == MAX_REASON_LENGTH
+        assert self.client._expected_len < declared
+        self.client.transport.loseConnection.assert_not_called()
+
+        self.client._packet += b"b" * MAX_REASON_LENGTH
+        self.client._handler()
+        message = self.client.vncProtocolError.call_args.args[0]
+        assert "truncated" in message
+        assert str(declared) in message
+        self.client.transport.loseConnection.assert_called_once()
+        # no more than the cap is buffered
+        assert not self.client._packet
+
+    def test_conn_failed_one_byte_over_the_limit_is_truncated(self):
+        message = self._drive_conn_failed(
+            MAX_REASON_LENGTH + 1, b"c" * MAX_REASON_LENGTH
+        )
+        assert "truncated" in message
+
+    def test_conn_failed_invalid_encoding_still_tears_down(self):
+        # 0xff is never valid UTF-8; decoding must not raise through the
+        # connection teardown.
+        message = self._drive_conn_failed(2, b"\xff\xfe")
+        assert "Connection refused" in message
+        self.client.transport.loseConnection.assert_called_once()
+
+    def test_conn_failed_reason_waiting_when_peer_hangs_up_winds_down(self):
+        self.client.vncConnectionLost = mock.Mock()
+        self.client._handler = self.client._handleExpected
+        # server declares a reason but only sends part of it
+        self.client.expect(self.client._handleConnMessage, 10)
+        self.client._packet += b"short"
+        self.client.connectionLost(ConnectionDone())
+        self.client.vncConnectionLost.assert_called_once()
+        assert self.client._aborted
+        assert not self.client._packet
+
+    def test_data_after_a_lost_connection_is_ignored(self):
+        self.client.vncConnectionLost = mock.Mock()
+        self.client._handler = self.client._handleExpected
+        self.client.expect(self.client._handleConnMessage, 10)
+        self.client.connectionLost(ConnectionDone())
+        self.client.dataReceived(b"anything")
+        self.client.vncConnectionLost.assert_called_once()
+        assert not self.client._packet
+
+    def test_security_failure_with_huge_reason_is_truncated_end_to_end(self):
+        self.client.vncAuthFailed = mock.Mock()
+        declared = MAX_REASON_LENGTH * 2
+        payload = b"d" * MAX_REASON_LENGTH
+        self.client._packet += (
+            b"RFB 003.008\n"
+            b"\x01"  # one security type
+            b"\x01"  # NONE
+            + pack("!I", 1)  # result: failed
+            + pack("!I", declared)
+            + payload
+        )
+        self.client._handler()
+        reason = self.client.vncAuthFailed.call_args.args[0]
+        assert reason.startswith(payload)
+        assert reason.endswith(security_base.REASON_TRUNCATED_MARKER)
+        self.client.transport.loseConnection.assert_called_once()
+        assert not self.client._packet
+
+    def test_security_failure_reason_waiting_when_peer_hangs_up_winds_down(self):
+        self.client.vncConnectionLost = mock.Mock()
+        # negotiate NONE on 3.8, then the server sends "failed" and stalls
+        self.client._packet += b"RFB 003.008\n\x01\x01" + pack("!I", 1)
+        self.client._handler()
+        # parked waiting for the 4-byte reason length
+        assert not self.client._aborted
+        self.client.connectionLost(ConnectionDone())
+        assert self.client._aborted
+        self.client.vncConnectionLost.assert_called_once()
 
     def test_unknown_encoding_stops_processing_buffered_rectangles(self):
         self.client.vncProtocolError = mock.Mock()
@@ -261,9 +374,9 @@ class TestRFBClientSubclassWarning(TestCase):
 class TestDesEncrypt(TestCase):
 
     def test_matches_the_published_des_vector(self):
-        """ . "说明"The FIPS SP 800-17 single-DES vector, so this checks against
+        """The FIPS SP 800-17 single-DES vector, so this checks against
         published DES rather than against whatever this implementation
-        happens to produce.""" . "说明"
+        happens to produce."""
         key = bytes.fromhex("0123456789ABCDEF")
         plaintext = bytes.fromhex("4E6F772069732074")
 

@@ -1,4 +1,4 @@
-""" . "说明"
+"""
 RFB protocol implementattion, client side.
 
 Override :class:`RFBClient` and :class:`RFBFactory` in your application.
@@ -7,7 +7,7 @@ See vncviewer.py for an example.
 Reference:
 https://www.rfc-editor.org/rfc/rfc6143
 https://github.com/rfbproto/rfbproto/blob/master/rfbproto.rst
-""" . "说明"
+"""
 # (C) 2003 cliechti@gmx.net
 #
 # MIT License
@@ -41,6 +41,12 @@ from . import decoders, messages, security
 from .const import Encoding, AuthTypes, FenceFlags, MsgC2S, MsgS2C
 from .keys import Key
 from .pixelformat import PixelFormat
+from .security.base import (
+    REASON_TRUNCATED_MARKER,
+    REASON_TRUNCATED_TEXT,
+    bounded_reason,
+    decode_reason,
+)
 
 Ver = Tuple[int, int]
 
@@ -206,10 +212,21 @@ class RFBClient(Protocol):
 
     def _handleConnFailed(self, block: bytes) -> None:
         (waitfor,) = unpack("!I", block)
-        self.expect(self._handleConnMessage, waitfor)
+        # Never park on the declared length itself: it is an unbounded u32
+        # and could pin the connection waiting for (or buffering) gigabytes.
+        # Read at most the cap and mark an overlong reason as truncated.
+        size, truncated = bounded_reason(waitfor)
+        self.expect(self._handleConnMessage, size, waitfor, truncated)
 
-    def _handleConnMessage(self, block: bytes) -> None:
-        self.abortConnection(f"Connection refused: {block!r}")
+    def _handleConnMessage(
+        self, block: bytes, declared: int | None = None, truncated: bool = False
+    ) -> None:
+        message = decode_reason(block)
+        if truncated:
+            message = (
+                f"{message}{REASON_TRUNCATED_TEXT} ({declared} bytes declared)"
+            )
+        self.abortConnection(f"Connection refused: {message}")
 
     def ardRequestCredentials(self) -> None:
         if self.factory.username is None:
@@ -218,7 +235,7 @@ class RFBClient(Protocol):
             self.factory.password = getpass.getpass("password:")
 
     def sendPassword(self, password: str) -> None:
-        """ . "说明"send password""" . "说明"
+        """send password"""
         self.transport.write(des_encrypt(_vnc_des(password), self._challenge))
 
     def _doClientInitialization(self) -> None:
@@ -323,7 +340,7 @@ class RFBClient(Protocol):
     # ---  what a decoder may ask of the pump
 
     def requireFits(self, width: int, height: int) -> None:
-        """ . "说明"Raise unless a rectangle fits the framebuffer.""" . "说明"
+        """Raise unless a rectangle fits the framebuffer."""
         limit_w = self.width or self.MAX_DESKTOP_SIZE
         limit_h = self.height or self.MAX_DESKTOP_SIZE
         if not (0 <= width <= limit_w and 0 <= height <= limit_h):
@@ -332,7 +349,7 @@ class RFBClient(Protocol):
             )
 
     def rectBuffer(self, width: int, height: int) -> decoders.RectBuffer:
-        """ . "说明"A buffer for one rectangle, reused across rectangles.""" . "说明"
+        """A buffer for one rectangle, reused across rectangles."""
         self.requireFits(width, height)
         needed = width * height * self.bypp
         try:
@@ -343,7 +360,7 @@ class RFBClient(Protocol):
         return decoders.RectBuffer(width, height, self.bypp, self._rect_backing)
 
     def requirePayload(self, length: int) -> None:
-        """ . "说明"Raise unless a server-declared message payload fits the bound.""" . "说明"
+        """Raise unless a server-declared message payload fits the bound."""
         if length > self.MAX_MESSAGE_PAYLOAD:
             raise decoders.DecodeError(
                 f"payload of {length} bytes exceeds the {self.MAX_MESSAGE_PAYLOAD} "
@@ -384,6 +401,25 @@ class RFBClient(Protocol):
         self._packet.extend(data)
         self._handler()
 
+    def connectionLost(self, reason: Failure) -> None:
+        # A handler parked in ``expect`` would otherwise wait forever for the
+        # remaining bytes of a declared reason (or any other length), and a
+        # half-initialised connection needs to wind down just like a refused
+        # one does.
+        if self._aborted:
+            return
+        self._aborted = True
+        self._packet.clear()
+        self.vncConnectionLost(reason)
+
+    def vncConnectionLost(self, reason: Failure) -> None:
+        """the connection to the server was closed.
+
+        override to notice an unexpected disconnect while the protocol is
+        waiting on the server.
+        """
+        log.msg(f"connection lost: {reason}")
+
     def _handleExpected(self) -> None:
         if len(self._packet) >= self._expected_len:
             # `expect` is the only thing that re-arms the parked handler, so
@@ -400,11 +436,11 @@ class RFBClient(Protocol):
             self._already_expecting = False
 
     def abortConnection(self, reason: str) -> None:
-        """ . "说明"Report a protocol failure and stop parsing for good.
+        """Report a protocol failure and stop parsing for good.
 
         loseConnection is asynchronous and bytes already buffered are still
         delivered, so the parser has to be stopped here as well.
-        """ . "说明"
+        """
         self._aborted = True
         self._packet.clear()
         self.vncProtocolError(reason)
@@ -457,26 +493,26 @@ class RFBClient(Protocol):
         self.transport.write(pack("!BBHHHH", MsgC2S.FRAMEBUFFER_UPDATE_REQUEST, incremental, x, y, width, height))
 
     def keyEvent(self, key: Key | int, down: bool = True) -> None:
-        """ . "说明"For most ordinary keys, the "keysym" is the same as the corresponding ASCII value.
-        Other common keys are shown in the ``Key`` constants.""" . "说明"
+        """For most ordinary keys, the "keysym" is the same as the corresponding ASCII value.
+        Other common keys are shown in the ``Key`` constants."""
         self.transport.write(pack("!BBxxI", MsgC2S.KEY_EVENT, down, key))
 
     def pointerEvent(self, x: int, y: int, buttonmask: int = 0) -> None:
-        """ . "说明"Indicates either pointer movement or a pointer button press or release. The pointer is
+        """Indicates either pointer movement or a pointer button press or release. The pointer is
         now at (x-position, y-position), and the current state of buttons 1 to 8 are represented
         by bits 0 to 7 of button-mask respectively, 0 meaning up, 1 meaning down (pressed).
-        """ . "说明"
+        """
         self.transport.write(pack("!BBHH", MsgC2S.POINTER_EVENT, buttonmask, x, y))
 
     def clientCutText(self, message: str) -> None:
-        """ . "说明"The client has new ISO 8859-1 (Latin-1) text in its cut buffer.
+        """The client has new ISO 8859-1 (Latin-1) text in its cut buffer.
         (aka clipboard)
-        """ . "说明"
+        """
         data = message.encode("iso-8859-1")
         self.transport.write(pack("!BxxxI", MsgC2S.CLIENT_CUT_TEXT, len(data)) + data)
 
     def clientFence(self, flags: FenceFlags, payload: bytes = b"") -> None:
-        """ . "说明"Request, or respond to, a Fence synchronisation of the data stream.""" . "说明"
+        """Request, or respond to, a Fence synchronisation of the data stream."""
         self.transport.write(pack("!BxxxIB", MsgC2S.CLIENT_FENCE, flags, len(payload)) + payload)
 
     # ------------------------------------------------------
@@ -484,12 +520,12 @@ class RFBClient(Protocol):
     # override these in your application
     # ------------------------------------------------------
     def vncConnectionMade(self) -> None:
-        """ . "说明"connection is initialized and ready.
-        typicaly, the pixel format is set here.""" . "说明"
+        """connection is initialized and ready.
+        typicaly, the pixel format is set here."""
 
     def vncRequestPassword(self) -> None:
-        """ . "说明"a password is needed to log on, use :meth:`sendPassword` to
-        send one.""" . "说明"
+        """a password is needed to log on, use :meth:`sendPassword` to
+        send one."""
         if self.factory.password is None:
             log.msg("need a password")
             self.transport.loseConnection()
@@ -497,28 +533,28 @@ class RFBClient(Protocol):
         self.sendPassword(self.factory.password)
 
     def vncAuthFailed(self, reason: Failure) -> None:
-        """ . "说明"called when the authentication failed.
-        the connection is closed.""" . "说明"
+        """called when the authentication failed.
+        the connection is closed."""
         log.msg(f"Cannot connect {reason}")
 
     def vncProtocolError(self, reason: str) -> None:
-        """ . "说明"called when the server sends something we cannot handle.
-        the connection is closed.""" . "说明"
+        """called when the server sends something we cannot handle.
+        the connection is closed."""
         log.msg(reason)
 
     def beginUpdate(self) -> None:
-        """ . "说明"called before a series of :meth:`updateRectangle`,
-        :meth:`copyRectangle` or :meth:`fillRectangle`.""" . "说明"
+        """called before a series of :meth:`updateRectangle`,
+        :meth:`copyRectangle` or :meth:`fillRectangle`."""
 
     def commitUpdate(self, rectangles: list[tuple[int, int, int, int]] | None = None) -> None:
-        """ . "说明"called after a series of :meth:`updateRectangle`, :meth:`copyRectangle`
+        """called after a series of :meth:`updateRectangle`, :meth:`copyRectangle`
         or :meth:`fillRectangle` are finished.
 
         Typicaly, here is the place to request the next screen
         update with :meth:`framebufferUpdateRequest` with ``incremental=True``.
 
         :param rectangles: a list of tuples (x,y,w,h) with the updated rectangles.
-        """ . "说明"
+        """
 
     def updateRectangle(
         self,
@@ -529,25 +565,25 @@ class RFBClient(Protocol):
         data: bytes,
         pixel_format: PixelFormat,
     ) -> None:
-        """ . "说明"new bitmap data.
+        """new bitmap data.
 
         :param data: bytes in `pixel_format`, which is the negotiated format
             for every encoding in use today but need not be.
-        """ . "说明"
+        """
 
     def copyRectangle(
         self, srcx: int, srcy: int, x: int, y: int, width: int, height: int
     ) -> None:
-        """ . "说明"used for copyrect encoding. copy the given rectangle
-        (src, srxy, width, height) to the target coords (x,y)""" . "说明"
+        """used for copyrect encoding. copy the given rectangle
+        (src, srxy, width, height) to the target coords (x,y)"""
 
     def fillRectangle(
         self, x: int, y: int, width: int, height: int, color: bytes
     ) -> None:
-        """ . "说明"fill the area with the color.
+        """fill the area with the color.
 
         :param color: bytes in the pixel format set up earlier.
-        """ . "说明"
+        """
         # fallback variant, use update recatngle
         # override with specialized function for better performance
         self.updateRectangle(
@@ -557,24 +593,24 @@ class RFBClient(Protocol):
     def updateCursor(
         self, x: int, y: int, width: int, height: int, image: bytes, mask: bytes
     ) -> None:
-        """ . "说明"New cursor, focuses at (x, y)""" . "说明"
+        """New cursor, focuses at (x, y)"""
 
     def updateDesktopSize(self, width: int, height: int) -> None:
-        """ . "说明"New desktop size of width*height.""" . "说明"
+        """New desktop size of width*height."""
 
     def set_color_map(self, first: int, colors: list[tuple[int, int, int]]) -> None:
-        """ . "说明"The server is using a new color map.""" . "说明"
+        """The server is using a new color map."""
 
     def bell(self) -> None:
-        """ . "说明"bell""" . "说明"
+        """bell"""
 
     def copy_text(self, text: str) -> None:
-        """ . "说明"The server has new ISO 8859-1 (Latin-1) text in its cut buffer.
-        (aka clipboard)""" . "说明"
+        """The server has new ISO 8859-1 (Latin-1) text in its cut buffer.
+        (aka clipboard)"""
 
 
 class RFBFactory(protocol.ClientFactory):
-    """ . "说明"A factory for remote frame buffer connections.""" . "说明"
+    """A factory for remote frame buffer connections."""
 
     # the class of the protocol to build
     # should be overriden by application to use a derrived class
@@ -588,12 +624,12 @@ class RFBFactory(protocol.ClientFactory):
 
 
 def des_encrypt(key: bytes, data: bytes) -> bytes:
-    """ . "说明"Encrypt with single DES, as the VNC family's password handling uses.
+    """Encrypt with single DES, as the VNC family's password handling uses.
 
     Single DES in ECB is weak, and is what RFB specifies: both the
     authentication challenge response (RFC 6143 section 7.2.2) and the
     password file format are defined in terms of it, so a stronger
-    algorithm here would simply fail to talk to any VNC server.""" . "说明"
+    algorithm here would simply fail to talk to any VNC server."""
     # Triple-DES with the same 56-bit key repeated three times is
     # equivalent to single-DES. Passing the 8-byte key directly is deprecated
     # upstream; only 24-byte keys will be accepted in a future release.
@@ -602,21 +638,21 @@ def des_encrypt(key: bytes, data: bytes) -> bytes:
 
 
 def reverse_bits(data: bytes) -> bytes:
-    """ . "说明"The bit-reversal the VNC family applies to a DES key before using it,
+    """The bit-reversal the VNC family applies to a DES key before using it,
     both for the authentication challenge response here and for the
-    password obfuscation in ~/.vnc/passwd files.""" . "说明"
+    password obfuscation in ~/.vnc/passwd files."""
     return bytes(
         sum((128 >> i) if (k & (1 << i)) else 0 for i in range(8)) for k in data
     )
 
 
 def _vnc_des(password: str) -> bytes:
-    """ . "说明"Custom DES variant for RFB protocol.
+    """Custom DES variant for RFB protocol.
 
     RFB protocol for authentication requires client to encrypt
     challenge sent by server with password using DES method. However,
     bits in each byte of the password are put in reverse order before
-    using it as encryption key.""" . "说明"
+    using it as encryption key."""
     pw = f"{password:\0<8.8}"  # make sure its 8 chars long, zero padded
     key = pw.encode(
         "ASCII"
@@ -629,7 +665,7 @@ def _vnc_des(password: str) -> bytes:
 if __name__ == "__main__":
 
     class RFBTest(RFBClient):
-        """ . "说明"dummy client""" . "说明"
+        """dummy client"""
 
         def vncConnectionMade(self) -> None:
             print(f"Screen format: {self.pixel_format}")
@@ -649,7 +685,7 @@ if __name__ == "__main__":
             print("%s " * 5 % (x, y, width, height, repr(data[:20])))
 
     class RFBTestFactory(protocol.ClientFactory):
-        """ . "说明"test factory""" . "说明"
+        """test factory"""
 
         protocol = RFBTest
 
@@ -669,7 +705,7 @@ if __name__ == "__main__":
             reactor.stop()
 
     class Options(usage.Options):
-        """ . "说明"command line options""" . "说明"
+        """command line options"""
 
         optParameters = [
             ["display", "d", "0", "VNC display"],

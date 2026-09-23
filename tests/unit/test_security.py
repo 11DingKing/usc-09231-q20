@@ -41,7 +41,7 @@ def ffdh():
 
 
 def drive(handler, client, *blocks):
-    """ . "说明"Drive a handler's generator the way RFBClient._pump does.""" . "说明"
+    """Drive a handler's generator the way RFBClient._pump does."""
     generator = handler.handle(client)
     for block in (None, *blocks):
         try:
@@ -70,11 +70,11 @@ class ArdExchange(NamedTuple):
 
 
 def ard_exchange(client):
-    """ . "说明"Run the server half of the ARD exchange and decrypt what the client sent.
+    """Run the server half of the ARD exchange and decrypt what the client sent.
 
     The plaintext is recovered through the server's own shared secret, so it
     says what reached the server rather than what the client meant to build.
-    """ . "说明"
+    """
     handler = security.HANDLERS[AuthTypes.DIFFIE_HELLMAN]()
     with ffdh():
         params = dh.DHParameterNumbers(p=MODP_2048, g=ARD_GENERATOR)
@@ -190,6 +190,87 @@ class TestSecurityResult(TestCase):
         self.client.vncAuthFailed.assert_not_called()
         self.client.transport.loseConnection.assert_called_once()
 
+    def test_failure_from_38_with_an_empty_reason(self):
+        self.client._version = (3, 8)
+        outcome = self.drive_result(SECURITY_FAILED, pack("!I", 0))
+        assert outcome is False
+        self.client.vncAuthFailed.assert_called_once_with(b"")
+        self.client.transport.loseConnection.assert_called_once()
+
+    def test_failure_from_38_keeps_a_short_reason_intact(self):
+        self.client._version = (3, 8)
+        reason = b"nope, wrong secret"
+        outcome = self.drive_result(
+            SECURITY_FAILED, pack("!I", len(reason)), reason
+        )
+        assert outcome is False
+        self.client.vncAuthFailed.assert_called_once_with(reason)
+
+    def test_failure_from_38_reason_at_exactly_the_limit_is_complete(self):
+        self.client._version = (3, 8)
+        reason = b"r" * security.MAX_REASON_LENGTH
+        outcome = self.drive_result(
+            SECURITY_FAILED, pack("!I", security.MAX_REASON_LENGTH), reason
+        )
+        assert outcome is False
+        called_with = self.client.vncAuthFailed.call_args.args[0]
+        assert called_with == reason
+        assert security.REASON_TRUNCATED_MARKER not in called_with
+
+    def test_failure_from_38_one_byte_over_the_limit_is_truncated(self):
+        self.client._version = (3, 8)
+        declared = security.MAX_REASON_LENGTH + 1
+        payload = b"s" * security.MAX_REASON_LENGTH
+        outcome = self.drive_result(
+            SECURITY_FAILED, pack("!I", declared), payload
+        )
+        assert outcome is False
+        called_with = self.client.vncAuthFailed.call_args.args[0]
+        assert called_with.startswith(payload)
+        assert called_with.endswith(security.REASON_TRUNCATED_MARKER)
+        # it never waits for the declared byte count
+        assert len(called_with) == security.MAX_REASON_LENGTH + len(
+            security.REASON_TRUNCATED_MARKER
+        )
+
+    def test_failure_from_38_huge_length_is_bounded_before_the_read(self):
+        self.client._version = (3, 8)
+        generator = security.security_result(self.client)
+        generator.send(None)
+        generator.send(SECURITY_FAILED)
+        requested = generator.send(pack("!I", 0xFFFFFFFF))
+        assert requested == security.MAX_REASON_LENGTH
+        generator.close()
+        self.client.transport.loseConnection.assert_not_called()
+
+
+class TestReasonDecoding(TestCase):
+
+    def test_empty_reason_decodes_to_an_empty_string(self):
+        assert security.base.decode_reason(b"") == ""
+
+    def test_valid_utf8_reason_is_kept_intact(self):
+        reason = "falsches passwort".encode("utf-8")
+        assert security.base.decode_reason(reason) == "falsches passwort"
+
+    def test_invalid_utf8_does_not_raise(self):
+        # bytes no UTF-8 decoder accepts must not break the teardown
+        decoded = security.base.decode_reason(b"\xff\xfe\xfd")
+        assert decoded  # replacement characters make it non-empty
+        assert "�" in decoded
+
+    def test_bounded_reason_marks_and_clamps_the_length(self):
+        size, truncated = security.base.bounded_reason(
+            security.MAX_REASON_LENGTH
+        )
+        assert (size, truncated) == (security.MAX_REASON_LENGTH, False)
+        size, truncated = security.base.bounded_reason(
+            security.MAX_REASON_LENGTH + 1
+        )
+        assert (size, truncated) == (security.MAX_REASON_LENGTH, True)
+        size, truncated = security.base.bounded_reason(0xFFFFFFFF)
+        assert (size, truncated) == (security.MAX_REASON_LENGTH, True)
+
 
 class TestVNCAuthenticationHandler(TestCase):
 
@@ -259,7 +340,7 @@ CREDENTIALS_THAT_DO_NOT_FIT = (
 
 
 class ArdCredentialsFit:
-    """ . "说明"The server decrypts both fields whole out of a 128-byte plaintext.""" . "说明"
+    """The server decrypts both fields whole out of a 128-byte plaintext."""
 
     username: str
     password: str
@@ -278,7 +359,7 @@ class ArdCredentialsFit:
 
 
 class ArdCredentialsDoNotFit:
-    """ . "说明"A credential too long for its field ends the attempt, saying which.""" . "说明"
+    """A credential too long for its field ends the attempt, saying which."""
 
     username: str
     password: str
