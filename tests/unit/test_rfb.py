@@ -2,7 +2,7 @@ import warnings
 from struct import pack
 from unittest import TestCase, mock
 
-from vncdotool import rfb
+from vncdotool import rfb, security
 
 
 class TestRFB(TestCase):
@@ -218,6 +218,88 @@ class TestRFB(TestCase):
         assert self.client.factory.password == "secret"
 
 
+class TestConnFailedReason(TestCase):
+    """The connection-refused reason string is capped, truncated and decoded."""
+
+    def setUp(self) -> None:
+        self.client = rfb.RFBClient()
+        self.client.transport = mock.Mock()
+        self.client.factory = mock.Mock()
+        self.client.vncProtocolError = mock.Mock()
+
+    def refuse(self, declared_len: int, reason: bytes = b"") -> None:
+        """Play a 3.3 handshake that fails with the given reason string."""
+        self.client.dataReceived(
+            b"RFB 003.003\n"
+            + pack("!I", rfb.AuthTypes.INVALID)
+            + pack("!I", declared_len)
+            + reason
+        )
+
+    def reason_message(self) -> str:
+        (message,), _ = self.client.vncProtocolError.call_args
+        return message
+
+    def test_short_reason_is_reported_as_is(self):
+        self.refuse(26, b"Too many security failures")
+        self.assertEqual(
+            self.reason_message(),
+            "Connection refused: Too many security failures",
+        )
+        self.client.transport.loseConnection.assert_called_once()
+
+    def test_empty_reason_aborts_cleanly(self):
+        self.refuse(0)
+        self.assertEqual(self.reason_message(), "Connection refused: ")
+        self.client.transport.loseConnection.assert_called_once()
+
+    def test_reason_at_the_length_cap_is_passed_through_whole(self):
+        reason = b"x" * security.MAX_REASON_LENGTH
+        self.refuse(len(reason), reason)
+        message = self.reason_message()
+        self.assertEqual(
+            message, "Connection refused: " + "x" * security.MAX_REASON_LENGTH
+        )
+        assert "truncated" not in message
+
+    def test_reason_one_byte_over_the_cap_is_truncated(self):
+        declared = security.MAX_REASON_LENGTH + 1
+        self.refuse(declared, b"x" * declared)
+        message = self.reason_message()
+        assert message.startswith(
+            "Connection refused: " + "x" * security.MAX_REASON_LENGTH
+        )
+        assert f"server declared {declared} bytes" in message
+        self.client.transport.loseConnection.assert_called_once()
+        # the byte past the cap is dropped with the rest of the connection
+        assert not self.client._packet
+
+    def test_huge_declared_reason_bounds_the_wait_and_the_buffer(self):
+        self.refuse(0xFFFFFFFF)
+        # waits for the capped length, not the 4 GiB the server claimed
+        assert self.client._expected_len == security.MAX_REASON_LENGTH
+        self.client.vncProtocolError.assert_not_called()
+
+        # the server goes quiet early; what little arrived stays bounded
+        self.client.dataReceived(b"x" * 100)
+        self.client.vncProtocolError.assert_not_called()
+        assert len(self.client._packet) == 100
+
+        # once the cap arrives the connection is closed, not held open
+        self.client.dataReceived(b"x" * (security.MAX_REASON_LENGTH - 100))
+        self.client.vncProtocolError.assert_called_once()
+        self.client.transport.loseConnection.assert_called_once()
+        assert "truncated" in self.reason_message()
+        assert not self.client._packet
+
+    def test_reason_with_invalid_utf8_is_replaced_not_raised(self):
+        self.refuse(4, b"\xff\xfe\x80x")
+        message = self.reason_message()
+        assert message.startswith("Connection refused: ")
+        assert "�" in message
+        self.client.transport.loseConnection.assert_called_once()
+
+
 class TestRFBClientSubclassWarning(TestCase):
 
     def test_overriding_updateRectangle_warns(self):
@@ -261,9 +343,9 @@ class TestRFBClientSubclassWarning(TestCase):
 class TestDesEncrypt(TestCase):
 
     def test_matches_the_published_des_vector(self):
-        """ . "说明"The FIPS SP 800-17 single-DES vector, so this checks against
+        """The FIPS SP 800-17 single-DES vector, so this checks against
         published DES rather than against whatever this implementation
-        happens to produce.""" . "说明"
+        happens to produce."""
         key = bytes.fromhex("0123456789ABCDEF")
         plaintext = bytes.fromhex("4E6F772069732074")
 
